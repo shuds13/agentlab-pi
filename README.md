@@ -1,0 +1,170 @@
+<!-- If you are an agent, read AGENTS.md: it is how to set someone up here. -->
+
+# AgentLab
+
+*A research lab run by agents.*
+
+**[Presentation →](https://github.com/shuds13/agentlab_slides/blob/main/agentlab.pdf)** &nbsp;|&nbsp; **[Tutorial →](https://github.com/shuds13/agentlab_slides/blob/main/agentlab_tutorial.pdf)**
+
+An experimental lab for persistent agent tasks that submit work to HPC systems.
+
+Built on the same machinery as
+[CAS framework](https://github.com/shuds13/cas-framework), which coordinates many
+agents on a single search campaign. AgentLab allows a user or team to run any number of
+investigations side by side, all visible and steerable from one UI or Slack channel.
+
+You give an agent a goal and a system. It submits the work, reads what comes back,
+decides what to try next, and keeps going until it has an answer.
+
+Each investigation is a **campaign**. Campaigns are independent and can run at the same
+time, sharing the framework, the system definitions, and optionally one Slack app and
+secretary.
+
+## Structure
+
+```
+lab.yaml       what this lab runs, and where its own things are. Copied from
+               lab.yaml.template. Not tracked by git.
+
+bin/           the commands people type. bin/lab.sh start | stop | status runs
+               the lab's long-lived processes.
+
+litellm/       config.yaml — non-Anthropic models this lab can reach, through
+               a LiteLLM proxy. Not tracked by git.
+
+framework/     the agent loop and the tools it calls. Not edited per campaign.
+
+methods/       how the agent goes about the work, and what it records — such as
+               quick.md, standard.md, or research.md for hypothesis cycles with
+               a written-up journal. Setup copies one into your campaign as
+               method.md, which is yours to edit or replace.
+
+systems/       one file per machine: module line, proxy, cache paths, queue
+               defaults — whatever is true for everyone there.
+               endpoints/ — Globus Compute endpoint templates.
+
+users/<you>/   your endpoint UUID, account, and working directory, per system.
+               Applies to every campaign you run there. Not tracked by git.
+
+campaigns/<name>/
+               prompt.md        the goal
+               user_prompt.md   this run's kick-off
+               task.py          what a job does
+               campaign.json    which system, and what to run on it
+               method.md        how the agent works, copied from methods/
+
+workspace/<name>/
+               everything the agent produces. Not tracked by git.
+```
+
+## Getting started
+
+Clone this repository, start your agent in it, and say:
+
+> Help me set up.
+
+It asks which of two you want.
+
+**Set up the lab and run the example** — the one to take if you are new. It runs on the
+machine you are already on: no account, no endpoint. It checks the install, gives you
+the command for the example campaign, and reads the results back with you. Slack for the
+lab is offered along the way.
+
+**Set up a campaign of your own** — it asks what you are trying to find out, which
+machine you will run on, and what files you already have. From that it creates
+`campaigns/<your-name>/`, writes the files a campaign needs, records your access in
+`users/<you>/`, and walks you through the Globus Compute endpoint.
+
+The agent uses whichever LLM your Claude Code settings point at. `docs/llm.md` covers
+running against a facility gateway, or against a non-Claude model through LiteLLM.
+
+If you would rather set it up by hand, `docs/setup.md` covers the same ground and
+`campaigns/example-vllm-inference-opt/README.md` describes what a campaign directory
+holds.
+
+## Running
+
+Each campaign has its own `run.sh` holding its settings — job budget, wallclock cap,
+Slack. Edit it, then from the campaign directory:
+
+```
+cd campaigns/<name> && ./run.sh
+```
+
+Start it inside tmux. A campaign runs for hours or days, and closing the terminal kills
+it with jobs in flight.
+
+```
+bin/list_agents.sh --all          every run and its outcome
+bin/kill_agent.sh --drain <run>   stop cleanly, finishing jobs in flight
+bin/lab.sh status                 the lab's own processes, and their logs
+```
+
+## Watching
+
+A browser view of the lab: every campaign, which are running, and the files each one is
+writing.
+
+On the machine the lab is on:
+
+```
+bin/watch.sh                      the lab, at http://127.0.0.1:8765/
+bin/watch.sh <campaign>           open on one campaign
+```
+
+From your own computer, when the lab is on a machine you reach by ssh:
+
+```
+bin/watch_remote.sh <host> <path-to-AgentLab-there>
+```
+
+It logs in once, starts the watcher over there, forwards the port it took, and opens
+your browser. Set `HOST`, `REPO` and `ACTIVATE` at the top of the script and it needs no
+arguments. Ctrl-C stops both ends.
+
+## Writing a campaign
+
+Copy `campaigns/example-vllm-inference-opt/` and replace four files:
+
+| file | what it holds |
+|---|---|
+| `prompt.md` | the goal, what is fixed, what may vary, when to stop |
+| `user_prompt.md` | what to do first |
+| `task.py` | how one job runs, what it returns, and what the agent is told about it |
+| `campaign.json` | which system, and any parameters for it |
+| `method.md` | how the agent goes about the work — copied from `methods/` at setup |
+
+`task.py` defines the job. For work that runs on the system: `JOB_DESC`, `JOB_SCHEMA`,
+`job_key`, `remote_fn` — `remote_fn` is sent to the worker by source, so everything it
+needs must be imported inside it or passed in through its arguments. For work that runs
+on the machine the agent is on: `LOCAL_DESC`, `LOCAL_SCHEMA`, `local_fn`. A task may
+define both, and the agent is given tools for whichever it defines. A task with only
+`local_fn` needs no Globus Compute endpoint.
+
+Nothing in `framework/` changes.
+
+## The example campaigns
+
+`campaigns/example-quick-optimum/` — one dial, a noisy response, a lowest point to find.
+Runs in minutes on your own machine, with no endpoint and no account. Setup starts here.
+
+`campaigns/example-local-compression/` — real work on the same footing: which zlib
+setting gets a corpus to a consumer fastest, trading encode time against transmit time.
+Also entirely on your own machine.
+
+`campaigns/example-vllm-inference-opt/` tunes single-node vLLM inference for
+Llama-3-70B on Aurora: it measures per-token decode rate and searches for a
+configuration that lowers it. It shows the shape of a campaign — a prompt stating the
+goal, what is fixed, what may vary and the leads to work; and a task that runs one
+benchmark configuration and returns metrics plus startup diagnostics.
+
+Its own README describes what a campaign directory holds and what to add for your
+problem.
+
+## Current limits
+
+- `task.py` in the example exposes a fixed set of vLLM flags. An `extra_args`
+  passthrough would let a campaign reach any flag its version supports.
+- Slack is present and unwired — `framework/secretary.py` and the bridge scripts.
+- One resource bucket per system. Several shapes per system would need
+  `systems/<system>.json` extended.

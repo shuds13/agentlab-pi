@@ -1,0 +1,947 @@
+"""CAS framework tools: run work on an HPC endpoint via Globus Compute, and
+coordinate several agents through a shared directory.
+
+This file is domain-agnostic. WHAT gets submitted comes from a task plug-in
+(see the campaign's task.py, and AGENTS.md); this file owns the mechanism around it:
+claiming work so two agents never duplicate it, tracking futures, capacity limits,
+draining on shutdown, the announcements board, and notification.
+
+Which system to run on is picked with the SYSTEM env var and described in
+config.json.
+"""
+
+import importlib
+import itertools
+import json
+import os
+import fcntl
+import subprocess
+import sys
+import time
+import traceback
+from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED, ThreadPoolExecutor
+from concurrent.futures import wait as _futures_wait
+
+import mcp_tool
+from mcp_tool import tool
+
+import transfer as _transfer
+from globus_compute_sdk import Executor
+from globus_compute_sdk.serialize import ComputeSerializer, AllCodeStrategies
+
+ROLE = os.environ.get("ROLE", "both")          # free-form; the prompt defines what roles mean
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LAB_DIR = os.path.abspath(os.environ.get("LAB_DIR", os.path.join(SCRIPT_DIR, "..")))
+WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", SCRIPT_DIR)
+
+CAMPAIGN = os.environ.get("CAMPAIGN", "")
+USER_NAME = os.environ.get("USER_NAME") or os.environ.get("USER", "")
+
+
+def _read_json(path, what, needs=()):
+    """Load one configuration file, saying what to do about it if it is unusable."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        sys.exit(f"{what} not found: {path}")
+    except json.JSONDecodeError as e:
+        sys.exit(f"{what} is not valid JSON: {path}\n  {e}")
+    missing = [k for k in needs if not data.get(k) or str(data[k]).startswith("<")]
+    if missing:
+        sys.exit(f"{what} needs {', '.join(missing)} filled in: {path}")
+    return data
+
+
+# Configuration comes from three files, composed here. Machine facts are shared, access
+# is per user, and what to run is per campaign, so each fact is stated once.
+if not CAMPAIGN:
+    sys.exit("CAMPAIGN is not set (the directory name under campaigns/).")
+
+_CAMPAIGN_DIR = os.path.join(LAB_DIR, "campaigns", CAMPAIGN)
+_cam = _read_json(os.path.join(_CAMPAIGN_DIR, "campaign.json"),
+                  f"campaign '{CAMPAIGN}'", needs=("system",))
+SYSTEM = os.environ.get("SYSTEM") or _cam["system"]
+
+_sys_cfg = _read_json(os.path.join(LAB_DIR, "systems", f"{SYSTEM}.json"),
+                      f"system '{SYSTEM}'")
+
+# --- the task plug-in ----------------------------------------------------------
+# Supplies what a job IS: how it is described to the agent, what arguments it takes,
+# how a piece of work is identified, and the function that runs remotely.
+# See AGENTS.md for the contract.
+#
+# The task is imported from its own directory rather than copied in here, so it can
+# keep support files (scripts, data) beside it and refer to them relative to its own
+# __file__.
+TASK_DIR = os.path.abspath(os.environ.get("TASK_DIR", _CAMPAIGN_DIR))
+if TASK_DIR not in sys.path:
+    sys.path.insert(0, TASK_DIR)
+task = importlib.import_module(os.environ.get("TASK_MODULE", "task"))
+HAS_LOCAL = hasattr(task, "local_fn")
+# Remote work needs both halves: a task that defines the function, and a system that
+# sends work somewhere. A task with both functions runs either way, by the system it
+# is given.
+HAS_REMOTE = hasattr(task, "remote_fn") and _sys_cfg.get("remote", True)
+
+# Only remote jobs need a Globus endpoint and an account to charge, so a task that
+# defines local_fn alone runs without either -- and without a user file at all. Its
+# work_dir then defaults to the campaign workspace.
+_user_path = os.path.join(LAB_DIR, "users", USER_NAME, f"{SYSTEM}.json")
+if HAS_REMOTE:
+    # A system with no batch scheduler has nothing to charge, so it says so and the
+    # account is not asked for.
+    _needs = ("endpoint",)
+    if _sys_cfg.get("needs_account", True):
+        _needs += ("account",)
+    _usr = _read_json(_user_path, f"your access to '{SYSTEM}'", needs=_needs)
+    # Where this campaign's jobs write. `work_dir` names it outright and wins;
+    # `work_root` is the directory campaigns sit under, with the campaign appended.
+    if not _usr.get("work_dir"):
+        _root = _usr.get("work_root")
+        if not _root:
+            raise SystemExit(
+                f"{_user_path} needs 'work_dir' (an exact path) or 'work_root' "
+                f"(the directory campaigns sit under; '{CAMPAIGN}' is appended).")
+        _usr["work_dir"] = os.path.join(_root, CAMPAIGN)
+else:
+    _usr = (_read_json(_user_path, f"your access to '{SYSTEM}'")
+            if os.path.isfile(_user_path) else {})
+    _usr.setdefault("work_dir", os.path.join(LAB_DIR, "workspace", CAMPAIGN))
+
+ENDPOINT_ID = _usr.get("endpoint", "")
+
+# Globus Transfer is optional: configured per user, and simply absent otherwise. It is
+# how the agent reads files on the compute system when the two do not share a filesystem.
+_transfer.CFG = _transfer.configure(_usr, os.path.join(LAB_DIR, "workspace", CAMPAIGN),
+                                   _CAMPAIGN_DIR, _sys_cfg)
+HAS_TRANSFER = _transfer.CFG is not None
+# How many jobs may be in flight at once. The system file holds a site default, bounded
+# by queue policy and allocation rather than by the size of the machine; a campaign
+# overrides it, because what is sensible depends on what one job does.
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT",
+                                    _cam.get("max_concurrent",
+                                             _sys_cfg.get("max_concurrent", 1))))
+
+# Named resource shapes on one system (e.g. a small quick queue and a large long one).
+# A task routes a job to one with bucket_for(args); otherwise the default is used.
+#
+# `resources` in campaign.json is one shape, and is all a campaign needs where its jobs
+# are all the same size. A campaign whose jobs differ instead gives `buckets`: a name to
+# a shape, each filling in from `resources` for what it does not say, and the first named
+# is the default. Each bucket gets its own executor and its own block pool on the endpoint.
+_bucket_defaults = dict(_sys_cfg.get("bucket_defaults", {}))
+_bucket_defaults.update(_cam.get("resources", {}))    # campaign: queue, walltime, nodes
+_bucket_defaults.update(_usr.get("resources", {}))    # user: anything they must override
+_bucket_defaults["account"] = _usr.get("account", "")
+
+_cam_buckets = _cam.get("buckets") or {"default": {}}
+_SYS = {"buckets": {}}
+for _name, _over in _cam_buckets.items():
+    _cfg = dict(_bucket_defaults)
+    _cfg.update(_over or {})
+    # A bucket's own cap on jobs in flight. Popped out: user_config goes to the endpoint
+    # as the batch system's configuration and this is not one of its settings.
+    _cap = _cfg.pop("max_concurrent", None)
+    _SYS["buckets"][_name] = {"num_nodes": _cfg.get("num_nodes", 1), "user_config": _cfg,
+                              "max_concurrent": int(_cap) if _cap else None}
+_default_bucket = next(iter(_SYS["buckets"]))
+
+# TARGET is handed to the task's remote_fn. Everything the remote side needs must be
+# in here: the function is shipped source-only and cannot read this module.
+TARGET = dict(_sys_cfg.get("target", {}))
+_cam_target = dict(_cam.get("target", {}))
+# env merges key by key, so a campaign adds to the system's environment rather than
+# replacing it. Everything else the campaign sets wins outright.
+TARGET["env"] = {**TARGET.get("env", {}), **_cam_target.pop("env", {})}
+TARGET.update(_cam_target)
+TARGET["work_dir"] = _usr["work_dir"]
+WORK_DIR = _usr["work_dir"]     # surfaced at preflight and recorded in meta.json
+TARGET.setdefault("ppn", _sys_cfg.get("ppn", 1))
+TARGET["nranks"] = _SYS["buckets"][_default_bucket].get("num_nodes", 1) * TARGET["ppn"]
+
+REMOTE_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "43200"))   # 12h client-side wait
+LOCAL_TIMEOUT = int(os.environ.get("LOCAL_JOB_TIMEOUT", "14400"))     # 4h
+# The same, for jobs run on this machine. One by default: a local job is assumed to use
+# the whole thing, and a task whose jobs are small enough to share it says so.
+LOCAL_MAX_CONCURRENT = int(os.environ.get("LOCAL_MAX_CONCURRENT",
+                                          _cam.get("local_max_concurrent",
+                                                   _sys_cfg.get("local_max_concurrent", 1))))
+
+# Whether a wait returns on the first job to finish or once they have all finished.
+# Jobs that take similar times are read together, so waking on the first spends a turn
+# on a fraction of the answer; jobs whose durations vary widely are read as they land.
+BATCH_MODE = str(os.environ.get("BATCH_MODE",
+                                _cam.get("batch_mode",
+                                         _sys_cfg.get("batch_mode", False)))).lower() \
+    in ("1", "true", "yes")
+# Jobs a batch submit fires in one call. The capacity of whichever backend the run uses,
+# by default: a batch that does not fill it leaves slots idle for as long as the batch
+# takes, and one larger than it is refused.
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE",
+                                _cam.get("batch_size",
+                                         _sys_cfg.get("batch_size",
+                                                      MAX_CONCURRENT if HAS_REMOTE
+                                                      else LOCAL_MAX_CONCURRENT))))
+
+# One Executor per bucket, created lazily and reused. Each distinct user_endpoint_config
+# gets its own block pool on the endpoint, so buckets can run concurrently.
+_executors = {}
+_sa_executor = None        # local backend, created lazily
+
+_jobs = {}                 # remote: job_id -> {"future", "args", "key", "bucket"}
+_job_counter = itertools.count(1)
+_submit_count = 0
+MAX_SUBMITS = int(os.environ.get("MAX_SUBMITS", "60"))   # backstop on total jobs per run
+
+_local_jobs = {}           # local: job_id -> {"future", "args"}
+_local_counter = itertools.count(1)
+_local_submit_count = 0
+
+# Wind-down flag. When set, submitting NEW work is refused so outstanding jobs can
+# drain and the run can end cleanly. Collecting finished work is unaffected.
+_stop_requested = False
+
+JOBS_LOG = os.path.join(WORKSPACE_DIR, "jobs.jsonl")          # durable record of every job fired
+
+# --- Shared announcements board -------------------------------------------------
+# One plain text file. Anyone (an operator, a Slack bridge) appends lines; every
+# agent reads it and decides what applies to it. No routing, no per-agent state.
+ANNOUNCEMENTS_FILE = os.path.join(WORKSPACE_DIR, "ANNOUNCEMENTS.md")
+# Both sides of the conversation with whoever is watching, in the order they were said.
+# The agent's own messages are written here whether or not a transport is configured, so
+# a lab with no transport still has somewhere for notify to land.
+MESSAGES_FILE = os.path.join(WORKSPACE_DIR, "MESSAGES.md")
+
+NOTIFY_SCRIPT = os.path.join(SCRIPT_DIR, "notify.sh")
+_last_success_time = None   # last non-error completion (real progress)
+_problem_since = None       # when the agent flagged a blocking problem (None = none)
+
+
+def record_message(who, msg):
+    """Add one line to the run's conversation. Best-effort: a record nobody can write
+    is not a reason to lose a message or fail a turn."""
+    try:
+        with open(MESSAGES_FILE, "a") as f:
+            f.write(f"`{time.strftime('%H:%M')}` **{who}** {msg.strip()}\n\n")
+    except Exception:
+        pass
+
+
+def _slack_post(msg):
+    """Best-effort post to the lab. Never raises; a transport is optional."""
+    if not os.path.isfile(NOTIFY_SCRIPT):
+        return
+    try:
+        subprocess.run(["bash", NOTIFY_SCRIPT, msg], timeout=30,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def problem_since():
+    """When the agent last flagged an unresolved blocking problem, else None."""
+    return _problem_since
+
+
+def backend_trouble():
+    """Health probe run at each no-progress wait tick. Returns a short problem string
+    if the backend looks dead -- endpoint offline, or ALL in-flight tasks failed/lost --
+    else None. A normal long queue is healthy and returns None, so a slow site is never
+    false-flagged. Read-only; a transient query error returns None rather than raising."""
+    if not HAS_REMOTE:
+        return None
+    import globus_compute_sdk as _gc
+    try:
+        c = _gc.Client()
+        st = (c.get_endpoint_status(ENDPOINT_ID) or {}).get("status")
+    except Exception:
+        return None
+    if st != "online":
+        return f"endpoint {ENDPOINT_ID} is not online (status={st})"
+    pend = [(jid, j) for jid, j in _jobs.items() if not j["future"].done()]
+    if not pend:
+        return None
+    bad = []
+    for jid, j in pend:
+        tid = getattr(j["future"], "task_id", None)
+        if not tid:
+            return None   # not populated yet (just submitted) -> not stuck
+        try:
+            t = c.get_task(tid) or {}
+        except Exception:
+            return None
+        status = str(t.get("status") or "").lower()
+        if status in ("failed", "lost", "cancelled") or t.get("exception"):
+            bad.append((jid, status or "exception"))
+    if bad and len(bad) == len(pend):
+        return f"all {len(pend)} in-flight task(s) failed/lost: {bad}"
+    return None
+
+
+def _append_jobs_log(record):
+    # The run that fired it: the log accumulates across every run of a campaign, so
+    # without this there is no way to say what this run did.
+    record = {"run": os.environ.get("RUN_ID", ""), **record}
+    try:
+        with open(JOBS_LOG, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+
+# --- cross-agent claims ---------------------------------------------------------
+# Agents share WORKSPACE_DIR. Before running a piece of work an agent claims it in
+# claims.jsonl under a file lock, so another never runs the same one. Released on
+# completion, or expires after CLAIM_STALE if an agent dies holding it.
+CLAIMS_FILE = os.path.join(WORKSPACE_DIR, "claims.jsonl")
+CLAIMS_LOCK = os.path.join(WORKSPACE_DIR, "claims.lock")
+CLAIM_STALE = int(os.environ.get("CLAIM_STALE_SECONDS", "21600"))  # 6h
+AGENT_ID = f"{SYSTEM}-{os.getpid()}"
+
+
+def _active_claims():
+    active = {}
+    if not os.path.exists(CLAIMS_FILE):
+        return active
+    now = time.time()
+    with open(CLAIMS_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                c = json.loads(line)
+            except Exception:
+                continue
+            key = c.get("key")
+            if c.get("state") == "done":
+                active.pop(key, None)
+            elif c.get("state") == "claimed":
+                if now - c.get("ts", 0) <= CLAIM_STALE:
+                    active[key] = c
+                else:
+                    active.pop(key, None)
+    return active
+
+
+def _try_claim(key, stage=""):
+    """Claim a piece of work atomically. Returns (True, None) or (False, holder)."""
+    with open(CLAIMS_LOCK, "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            held = _active_claims().get(key)
+            if held and held.get("agent") != AGENT_ID:
+                return False, held.get("agent")
+            with open(CLAIMS_FILE, "a") as f:
+                f.write(json.dumps({"key": key, "stage": stage, "agent": AGENT_ID,
+                                    "ts": time.time(), "state": "claimed"}) + "\n")
+            return True, None
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
+
+
+def _release_claim(key):
+    try:
+        with open(CLAIMS_LOCK, "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                with open(CLAIMS_FILE, "a") as f:
+                    f.write(json.dumps({"key": key, "agent": AGENT_ID,
+                                        "ts": time.time(), "state": "done"}) + "\n")
+            finally:
+                fcntl.flock(lk, fcntl.LOCK_UN)
+    except Exception:
+        pass
+
+
+# --- turn bookkeeping for agent.py's outer loop ---------------------------------
+def request_stop():
+    """Wind this run down: refuse NEW work so outstanding jobs can drain. Set by
+    agent.py on a stop request, spent budget, or time limit. Collecting is unaffected."""
+    global _stop_requested
+    _stop_requested = True
+
+
+def stop_is_requested():
+    return _stop_requested
+
+
+def submit_count():
+    """Jobs submitted this process that MAX_SUBMITS caps. Remote where the task has
+    remote_fn, else the local jobs -- so a local-only run is bounded the same way."""
+    return _submit_count if HAS_REMOTE else _local_submit_count
+
+
+def local_submit_count():
+    """Local jobs submitted this process (observability only -- no cap)."""
+    return _local_submit_count
+
+
+def _remote_pending_count(bucket=None):
+    return sum(1 for j in _jobs.values() if not j["future"].done()
+               and (bucket is None or j["bucket"] == bucket))
+
+
+def _bucket_of(args):
+    """Which bucket this job would go to, before it is fired."""
+    return task.bucket_for(args) if hasattr(task, "bucket_for") else _default_bucket
+
+
+def _local_pending_count():
+    return sum(1 for j in _local_jobs.values() if not j["future"].done())
+
+
+def jobs_in_flight():
+    """Jobs submitted but not yet collected (pending + done-but-uncollected)."""
+    return len(_jobs) + len(_local_jobs)
+
+
+def pending_count():
+    """In-flight jobs whose future is not yet done."""
+    return _remote_pending_count() + _local_pending_count()
+
+
+def wait_for_any(timeout=1800):
+    """Block until in-flight futures complete, or timeout; return how many finished.
+    Lets agent.py wait between turns without spinning or holding the LLM open. Under
+    BATCH_MODE the wait returns once they have all finished."""
+    futs = [j["future"] for j in _jobs.values() if not j["future"].done()]
+    futs += [j["future"] for j in _local_jobs.values() if not j["future"].done()]
+    if not futs:
+        return 0
+    done, not_done = _futures_wait(futs, timeout=timeout,
+                                   return_when=ALL_COMPLETED if BATCH_MODE
+                                   else FIRST_COMPLETED)
+    if BATCH_MODE and not_done:
+        return 0                    # the timeout, not the batch: there is more to come
+    return len(done)
+
+
+def read_announcements():
+    """Current text of the announcements board ('' if none). Never raises.
+    Polled (not inotify) on purpose: the board may live on a shared filesystem and be
+    written from another host, where inotify does not reliably fire."""
+    try:
+        with open(ANNOUNCEMENTS_FILE) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+    except Exception as e:
+        print(f"[announcements] read failed (ignored): {e}", flush=True)
+        return ""
+
+
+def get_executor(bucket=None):
+    if bucket is None:
+        bucket = _default_bucket
+    ex = _executors.get(bucket)
+    if ex is None or getattr(ex, "_stopped", False):
+        try:
+            if ex is not None:
+                ex.shutdown(wait=False)
+        except Exception:
+            pass
+        cfg = dict(_SYS["buckets"][bucket].get("user_config", {}))
+        ex = Executor(endpoint_id=ENDPOINT_ID, user_endpoint_config=cfg)
+        # Ship the function by source: the worker does not have this code installed.
+        ex.serializer = ComputeSerializer(strategy_code=AllCodeStrategies())
+        _executors[bucket] = ex
+    return ex
+
+
+def get_local_executor():
+    """Backend for local jobs. A thread pool is enough: local_fn blocks on a subprocess,
+    so no CPU work happens in the Python thread itself. max_workers matches the
+    admission check in submit_local."""
+    global _sa_executor
+    if _sa_executor is None:
+        _sa_executor = ThreadPoolExecutor(max_workers=LOCAL_MAX_CONCURRENT)
+    return _sa_executor
+
+
+def shutdown_executor():
+    for ex in list(_executors.values()):
+        try:
+            ex.shutdown(wait=False)
+        except Exception:
+            pass
+    _executors.clear()
+    global _sa_executor
+    if _sa_executor is not None:
+        try:
+            # Do not wait: a local job can run for hours, and blocking here would stop
+            # the rest of shutdown from happening. cancel_futures drops the queued work
+            # that has not started; a job already running is left to the exit below.
+            _sa_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        _sa_executor = None
+
+
+# --- tools the agent calls ------------------------------------------------------
+_WINDDOWN_REFUSAL = ("submit refused: this run is winding down. Collect and log the work "
+                     "already in flight, but do not submit anything new.")
+
+
+# The task states one job's parameters; a batch takes a list of them. Built here rather
+# than asked of the task, so a task written for single submits needs no change.
+from mcp_tool import _JSON_TYPES
+
+
+def _batch_schema(schema):
+    props = {name: {"type": _JSON_TYPES.get(typ, "string")}
+             for name, typ in (schema or {}).items()}
+    return {"type": "object",
+            "properties": {"jobs": {"type": "array", "minItems": 1,
+                                    "maxItems": BATCH_SIZE,
+                                    "items": {"type": "object", "properties": props}}},
+            "required": ["jobs"]}
+
+
+def _fire_remote(args):
+    """Claim one piece of remote work and start it. Returns {"job_id", "key"}, or
+    {"error"} for work already in flight, claimed elsewhere, or refused by the backend."""
+    global _submit_count
+    key = task.job_key(args)
+    # A fresh-context agent cannot remember what it already fired, so refuse a repeat.
+    for info in _jobs.values():
+        if info["key"] == key and not info["future"].done():
+            return {"error": f"submit refused: a job for {key} is already in flight. "
+                             f"Collect it with get_completed_jobs before re-submitting."}
+    ok, holder = _try_claim(key, stage=ROLE)
+    if not ok:
+        return {"error": f"submit skipped: {key} is already claimed by {holder}. "
+                         f"Pick different work."}
+
+    bucket = task.bucket_for(args) if hasattr(task, "bucket_for") else _default_bucket
+    if bucket not in _SYS["buckets"]:
+        return {"error": f"bucket {bucket!r} is not one of "
+                         f"{sorted(_SYS['buckets'])} -- check bucket_for in task.py."}
+    target = dict(TARGET)
+    _b = _SYS["buckets"][bucket]
+    target["nranks"] = _b.get("num_nodes", 1) * target["ppn"]
+    # The shape the job actually got, so it can size itself to the allocation it is in.
+    target["bucket"] = bucket
+    target["num_nodes"] = _b.get("num_nodes", 1)
+    target["walltime"] = _b.get("user_config", {}).get("walltime", "")
+    try:
+        fut = get_executor(bucket).submit(task.remote_fn, args, target)
+    except Exception as e:
+        _release_claim(key)
+        traceback.print_exc(file=sys.stderr)
+        return {"error": f"submit failed: {e}"}
+
+    job_id = next(_job_counter)
+    _submit_count += 1
+    _jobs[job_id] = {"future": fut, "args": args, "key": key, "bucket": bucket}
+    _append_jobs_log({"event": "submit", "job_id": job_id, "key": key, "args": args,
+                      "bucket": bucket, "task_id": getattr(fut, "task_id", None)})
+    return {"job_id": job_id, "key": key}
+
+
+@tool("submit_job", getattr(task, "JOB_DESC", ""), getattr(task, "JOB_SCHEMA", {}))
+async def submit_job(args):
+    """Fire one remote job and return immediately with a job_id."""
+    global _submit_count
+    if _stop_requested:
+        return {"content": [{"type": "text", "text": _WINDDOWN_REFUSAL}], "is_error": True}
+    if _submit_count >= MAX_SUBMITS:
+        return {"content": [{"type": "text", "text":
+                f"submit refused: hit MAX_SUBMITS={MAX_SUBMITS} total-jobs cap for this run"}],
+                "is_error": True}
+    if _remote_pending_count() >= MAX_CONCURRENT:
+        return {"content": [{"type": "text", "text":
+                f"submit refused: at capacity ({_remote_pending_count()} running/queued, "
+                f"max_concurrent={MAX_CONCURRENT}). Collect a finished job "
+                f"with get_completed_jobs before submitting more."}], "is_error": True}
+    _b = _bucket_of(args)
+    _cap = _SYS["buckets"].get(_b, {}).get("max_concurrent")
+    if _cap and _remote_pending_count(_b) >= _cap:
+        return {"content": [{"type": "text", "text":
+                f"submit refused: bucket {_b!r} is at capacity "
+                f"({_remote_pending_count(_b)} running/queued, max_concurrent={_cap}). "
+                f"Collect one of its jobs, or submit work that routes elsewhere."}],
+                "is_error": True}
+
+    fired = _fire_remote(args)
+    if "error" in fired:
+        return {"content": [{"type": "text", "text": fired["error"]}], "is_error": True}
+    job_id, key = fired["job_id"], fired["key"]
+    # The budget left, with the job that was just accepted counted. It changes as the
+    # run goes, so it belongs in what a submit answers rather than in a prompt written
+    # once at the start -- and it counts this run's submits, not the rows in a record
+    # that outlives the run.
+    return {"content": [{"type": "text", "text": json.dumps(
+        {"job_id": job_id, "key": key,
+         "submits_used": _submit_count, "submits_allowed": MAX_SUBMITS})}]}
+
+
+JOB_BATCH_DESC = (getattr(task, "JOB_DESC", "") +
+                  f"\n\nSubmit {BATCH_SIZE} jobs in one call, as `jobs`: a list of "
+                  f"{BATCH_SIZE} parameter sets, each of the form above. They run at "
+                  f"the same time and are collected together with get_completed_jobs.")
+
+
+@tool("submit_job_batch", JOB_BATCH_DESC,
+      _batch_schema(getattr(task, "JOB_SCHEMA", {})))
+async def submit_job_batch(args):
+    """Fire a whole batch of remote jobs and return immediately with their job_ids."""
+    if _stop_requested:
+        return {"content": [{"type": "text", "text": _WINDDOWN_REFUSAL}], "is_error": True}
+    jobs = args.get("jobs") or []
+    if not isinstance(jobs, list) or not all(isinstance(j, dict) for j in jobs):
+        return {"content": [{"type": "text", "text":
+                "submit refused: `jobs` must be a list of parameter sets"}], "is_error": True}
+    room = MAX_CONCURRENT - _remote_pending_count()
+    left = MAX_SUBMITS - _submit_count
+    wanted = min(BATCH_SIZE, room, left)
+    if wanted <= 0:
+        return {"content": [{"type": "text", "text":
+                f"submit refused: {_remote_pending_count()} job(s) running of "
+                f"{MAX_CONCURRENT}, {max(left, 0)} of {MAX_SUBMITS} submits left. "
+                f"Collect with get_completed_jobs."}], "is_error": True}
+    if len(jobs) != wanted:
+        return {"content": [{"type": "text", "text":
+                f"submit refused: this batch takes {wanted} jobs, got {len(jobs)}"}],
+                "is_error": True}
+    fired = [dict(_fire_remote(j), args=j) for j in jobs]
+    out = {"submitted": [f for f in fired if "error" not in f],
+           "refused": [f for f in fired if "error" in f],
+           "submits_used": _submit_count, "submits_allowed": MAX_SUBMITS}
+    return {"content": [{"type": "text", "text": json.dumps(out)}]}
+
+
+GET_COMPLETED_DESC = (
+    "Collect any finished jobs (non-blocking). Returns completed results and the list of "
+    "still-pending job_ids. Call it once near the start of a turn; jobs still running come "
+    "back on a later turn."
+)
+
+
+@tool("get_completed_jobs", GET_COMPLETED_DESC, {})
+async def get_completed_jobs(args):
+    global _last_success_time, _problem_since
+    completed = []
+    for job_id, info in list(_jobs.items()):
+        fut = info["future"]
+        if not fut.done():
+            continue
+        try:
+            res = fut.result()
+        except Exception as e:
+            traceback.print_exc(file=sys.stderr)
+            res = {"error": f"{type(e).__name__}: {e}", "args": info["args"]}
+        if not isinstance(res, dict):
+            res = {"result": res}
+        res["job_id"] = job_id
+        res.setdefault("key", info["key"])
+        if "error" not in res:
+            _last_success_time = time.time()
+            _problem_since = None        # real progress clears any flagged problem
+        completed.append(res)
+        _append_jobs_log({"event": "completed", "job_id": job_id, "key": info["key"],
+                          "error": "error" in res})
+        _release_claim(info["key"])
+        del _jobs[job_id]
+    pending = [{"job_id": jid, "key": i["key"], "args": i["args"], "bucket": i["bucket"]}
+               for jid, i in _jobs.items()]
+    return {"content": [{"type": "text", "text":
+            json.dumps({"completed": completed, "pending": pending}, indent=2, default=str)}]}
+
+
+@tool("submit_local", getattr(task, "LOCAL_DESC", ""), getattr(task, "LOCAL_SCHEMA", {}))
+async def submit_local(args):
+    """Fire the local comparator and return immediately with a job_id."""
+    global _local_submit_count
+    if _stop_requested:
+        return {"content": [{"type": "text", "text": _WINDDOWN_REFUSAL}], "is_error": True}
+    if not HAS_REMOTE and _local_submit_count >= MAX_SUBMITS:
+        return {"content": [{"type": "text", "text":
+                f"submit refused: hit MAX_SUBMITS={MAX_SUBMITS} total-jobs cap for this run"}],
+                "is_error": True}
+    if _local_pending_count() >= LOCAL_MAX_CONCURRENT:
+        return {"content": [{"type": "text", "text":
+                f"submit refused: a local job is already running (max {LOCAL_MAX_CONCURRENT} "
+                f"at a time -- it uses the whole node). Collect it with get_local_completed "
+                f"before submitting more."}], "is_error": True}
+    job_id = _fire_local(args)
+    # As for submit_job. Where the task has remote work too, MAX_SUBMITS caps that and
+    # local jobs are uncapped, so there is a count to report and no allowance.
+    out = {"job_id": job_id, "args": args, "local_submits_used": _local_submit_count}
+    if not HAS_REMOTE:
+        out["submits_allowed"] = MAX_SUBMITS
+    return {"content": [{"type": "text", "text": json.dumps(out)}]}
+
+
+def _fire_local(args):
+    """Start one local job and record it. Returns its job_id."""
+    global _local_submit_count
+    fut = get_local_executor().submit(task.local_fn, args)
+    job_id = next(_local_counter)
+    _local_submit_count += 1
+    _local_jobs[job_id] = {"future": fut, "args": args}
+    _append_jobs_log({"event": "local_submit", "job_id": job_id, "args": args})
+    return job_id
+
+
+BATCH_DESC = (getattr(task, "LOCAL_DESC", "") +
+              f"\n\nSubmit {BATCH_SIZE} jobs in one call, as `jobs`: a list of "
+              f"{BATCH_SIZE} parameter sets, each of the form above. They run at the "
+              f"same time and are collected together with get_local_completed.")
+
+
+@tool("submit_local_batch", BATCH_DESC,
+      _batch_schema(getattr(task, "LOCAL_SCHEMA", {})))
+async def submit_local_batch(args):
+    """Fire a whole batch of local jobs and return immediately with their job_ids."""
+    if _stop_requested:
+        return {"content": [{"type": "text", "text": _WINDDOWN_REFUSAL}], "is_error": True}
+    jobs = args.get("jobs") or []
+    if not isinstance(jobs, list) or not all(isinstance(j, dict) for j in jobs):
+        return {"content": [{"type": "text", "text":
+                "submit refused: `jobs` must be a list of parameter sets"}], "is_error": True}
+    room = LOCAL_MAX_CONCURRENT - _local_pending_count()
+    left = MAX_SUBMITS - _local_submit_count if not HAS_REMOTE else len(jobs)
+    wanted = min(BATCH_SIZE, room, left)
+    if wanted <= 0:
+        return {"content": [{"type": "text", "text":
+                f"submit refused: {_local_pending_count()} job(s) still running of "
+                f"{LOCAL_MAX_CONCURRENT}, {max(left, 0)} of {MAX_SUBMITS} submits left. "
+                f"Collect with get_local_completed."}], "is_error": True}
+    if len(jobs) != wanted:
+        return {"content": [{"type": "text", "text":
+                f"submit refused: this batch takes {wanted} jobs, got {len(jobs)}"}],
+                "is_error": True}
+    fired = [{"job_id": _fire_local(j), "args": j} for j in jobs]
+    out = {"submitted": fired, "local_submits_used": _local_submit_count}
+    if not HAS_REMOTE:
+        out["submits_allowed"] = MAX_SUBMITS
+    return {"content": [{"type": "text", "text": json.dumps(out)}]}
+
+
+GET_LOCAL_DESC = (
+    "Collect the finished local job, if any (non-blocking). Returns its results and any "
+    "still-pending job_id. Call it like get_completed_jobs -- once near the start of a turn."
+)
+
+
+@tool("get_local_completed", GET_LOCAL_DESC, {})
+async def get_local_completed(args):
+    completed = []
+    for job_id, info in list(_local_jobs.items()):
+        fut = info["future"]
+        if not fut.done():
+            continue
+        try:
+            res = fut.result()
+        except Exception as e:
+            traceback.print_exc(file=sys.stderr)
+            res = {"error": f"{type(e).__name__}: {e}", "args": info["args"]}
+        completed.append({"job_id": job_id, "results": res})
+        _append_jobs_log({"event": "local_completed", "job_id": job_id})
+        del _local_jobs[job_id]
+    pending = [{"job_id": jid, "args": i["args"]} for jid, i in _local_jobs.items()]
+    return {"content": [{"type": "text", "text":
+            json.dumps({"completed": completed, "pending": pending}, indent=2, default=str)}]}
+
+
+RELEASE_CLAIM_DESC = (
+    "Release a claim you are holding on a piece of work, so another agent can take it. "
+    "Use it for an orphaned claim from a crashed session: one with no job running and no "
+    "results. Pass the same key the job was claimed under."
+)
+
+
+@tool("release_claim", RELEASE_CLAIM_DESC, {"key": str})
+async def release_claim(args):
+    _release_claim(args["key"])
+    return {"content": [{"type": "text", "text": f"released claim on {args['key']}"}]}
+
+
+NOTIFY_DESC = (
+    "Post a short status message (1-2 lines) to the team's chat channel, in your own words. "
+    "Use it for: (a) the periodic status summary when asked to report; (b) a notable "
+    "milestone; (c) an ALERT when you have hit a problem you cannot get around (e.g. the "
+    "compute endpoint is unreachable and submissions keep failing). Set blocking=true ONLY "
+    "for a real problem you cannot work around: it tells the runner to shut the agent down "
+    "if the problem is not resolved within the grace period. Do not spam -- at most one "
+    "alert per distinct problem; a normal summary is one short line."
+)
+
+
+@tool("notify", NOTIFY_DESC, {"message": str, "blocking": bool})
+async def notify(args):
+    global _problem_since
+    blocking = bool(args.get("blocking", False))
+    if blocking and _problem_since is None:
+        _problem_since = time.time()
+    _slack_post(args["message"])
+    record_message("agent", args["message"])
+    note = " (blocking: shutdown grace started)" if blocking else ""
+    return {"content": [{"type": "text", "text": "notified" + note}]}
+
+
+CYCLE_DONE_DESC = (
+    "Call this when you have finished writing up a cycle, after its record is written. "
+    "Pass the cycle's conclusion in one or two lines -- what it established. It marks "
+    "the boundary of the cycle in the record. Where this lab runs a reviewer, that "
+    "boundary is where it reads: your write-up is checked against the results rows, and "
+    "anything they do not support comes back to you next turn. One call per cycle."
+)
+
+_cycle_mark = None      # set by cycle_done, read and cleared by the runner
+
+
+def cycle_done_pending():
+    """The conclusion the agent recorded when it last closed a cycle, or None. Reading
+    it clears it: a cycle is reviewed once."""
+    global _cycle_mark
+    mark, _cycle_mark = _cycle_mark, None
+    return mark
+
+
+@tool("cycle_done", CYCLE_DONE_DESC, {"conclusion": str})
+async def cycle_done(args):
+    global _cycle_mark
+    _cycle_mark = (args.get("conclusion") or "").strip() or "(no conclusion given)"
+    return {"content": [{"type": "text", "text":
+                         "cycle recorded; its write-up will be reviewed"}]}
+
+
+GOAL_MET_DESC = (
+    "Call this when the campaign's goal, as its own prompt states it, is met: the "
+    "question is answered to the standard that prompt sets. A good result is not a met "
+    "goal, and neither is a result you have not yet recorded -- write the evidence "
+    "first, then call this. Pass what settles it, in one or two lines. The run stops "
+    "taking new work, finishes what is in flight, and gives you a turn to write up."
+)
+
+_goal_met = None        # what the agent said settles the goal, or None
+
+
+def goal_is_met():
+    """What the agent said settles the campaign's goal, or None."""
+    return _goal_met
+
+
+@tool("goal_met", GOAL_MET_DESC, {"reason": str})
+async def goal_met(args):
+    global _goal_met
+    _goal_met = (args.get("reason") or "").strip() or "(no reason given)"
+    request_stop()
+    return {"content": [{"type": "text", "text":
+                         "goal recorded; this run is winding down -- collect what is in "
+                         "flight and write the cycle up"}]}
+
+
+END_RUN_DESC = (
+    "Call this when you have been asked to stop, rather than because the goal is met. "
+    "Pass who asked and what they asked for, in a line. The run stops taking new work, "
+    "finishes what is in flight, and gives you a turn to write up what it reached."
+)
+
+_end_requested = None   # what the agent was asked to stop for, or None
+
+
+def end_requested():
+    """What the agent said it was asked to stop for, or None."""
+    return _end_requested
+
+
+@tool("end_run", END_RUN_DESC, {"reason": str})
+async def end_run(args):
+    global _end_requested
+    _end_requested = (args.get("reason") or "").strip() or "(no reason given)"
+    request_stop()
+    return {"content": [{"type": "text", "text":
+                         "recorded; this run is winding down -- collect what is in "
+                         "flight and write the cycle up"}]}
+
+
+CHECK_BACKEND_DESC = (
+    "Check backend health when nothing has completed for a long time and you are unsure "
+    "whether your jobs are genuinely still queued or the backend is stuck. Returns the "
+    "endpoint status and the status of each in-flight task. Decide from it: if the endpoint "
+    "is offline or tasks are failed/lost, send notify(blocking=true) so the run shuts down; "
+    "if tasks are still waiting or running, it is a normal long queue -- keep waiting."
+)
+
+
+@tool("check_backend", CHECK_BACKEND_DESC, {})
+async def check_backend(args):
+    import globus_compute_sdk as _gc
+    info = {"endpoint_id": ENDPOINT_ID}
+    try:
+        c = _gc.Client()
+    except Exception as e:
+        return {"content": [{"type": "text", "text": json.dumps({"error": f"client init: {e}"})}],
+                "is_error": True}
+    try:
+        info["endpoint_status"] = c.get_endpoint_status(ENDPOINT_ID)
+    except Exception as e:
+        info["endpoint_status"] = {"error": str(e)}
+    tasks = []
+    for jid, j in list(_jobs.items()):
+        tid = getattr(j["future"], "task_id", None)
+        st = None
+        if tid:
+            try:
+                st = c.get_task(tid)
+            except Exception as e:
+                st = {"error": str(e)}
+        tasks.append({"job_id": jid, "key": j["key"], "task_id": tid,
+                      "future_done": j["future"].done(), "task_status": st})
+    info["in_flight_tasks"] = tasks
+    return {"content": [{"type": "text", "text": json.dumps(info, indent=2, default=str)}]}
+
+
+SERVER_NAME = "cas"
+
+
+def offered_tools():
+    """The tools this run offers, in the order they are presented. Each pair is only
+    offered when the task defines the matching function -- remote_fn for the remote
+    tools, local_fn for the local.
+
+    One list, stated once. The names and the callables were kept separately before,
+    which meant a tool could be offered to the model without being served, or served
+    without being offered."""
+    names = []
+    if HAS_REMOTE:
+        names += ["submit_job_batch" if BATCH_MODE else "submit_job",
+                  "get_completed_jobs", "release_claim"]
+    if HAS_LOCAL:
+        names += ["submit_local_batch" if BATCH_MODE else "submit_local",
+                  "get_local_completed"]
+    names += ["notify", "cycle_done", "goal_met", "end_run"]
+    if HAS_REMOTE:
+        names.append("check_backend")
+    if HAS_TRANSFER:
+        names.append("transfer")
+    return [mcp_tool.REGISTRY[n] for n in names]
+
+
+def tool_names(prefix=f"mcp__{SERVER_NAME}__"):
+    """The offered tool names as a host qualifies them. Claude Code writes an MCP tool
+    as mcp__<server>__<tool>, which is the default because that is what
+    ClaudeAgentOptions(tools=...) has always been given here. Another host passes its
+    own prefix."""
+    return [f"{prefix}{t.name}" for t in offered_tools()]
+
+
+def create_server():
+    """The same tools as an in-process Claude Agent SDK server, for agent.py.
+
+    The tools no longer depend on that SDK -- they are declared with the framework's
+    own decorator and served over stdio by mcp_server.py. This re-wraps them for the
+    harness that wants them in-process, and is the only place the SDK is needed, so it
+    is imported here rather than at module scope.
+    """
+    from claude_agent_sdk import create_sdk_mcp_server
+    from claude_agent_sdk import tool as sdk_tool
+
+    wrapped = [sdk_tool(t.name, t.description, t.input_schema)(t.handler)
+               for t in offered_tools()]
+    return create_sdk_mcp_server(name=SERVER_NAME, version="1.0.0", tools=wrapped)

@@ -1,0 +1,73 @@
+# Globus Compute endpoint template -- NERSC Perlmutter (Slurm).
+#
+# Lives on the machine that runs the work, at
+#   ~/.globus_compute/<endpoint-name>/user_config_template.yaml.j2
+# The placeholders below are filled per job from bucket_defaults in
+# systems/perlmutter.json, overridden by the campaign's `resources`.
+#
+# EDIT: worker_init. The account arrives from users/<you>/perlmutter.json.
+#
+# Perlmutter selects nodes by constraint ("gpu" or "cpu") and queue by QOS
+# ("debug", "regular", "interactive"), not by partition.
+
+# Shut the endpoint down after 20 idle heartbeats (~10 min) with no outstanding tasks,
+# releasing the Slurm allocation. Without this the block holds the node until walltime
+# expires whether or not work is running, and the idle time is charged.
+# idle_heartbeats_hard is left unset: it triggers on tasks that are outstanding but not
+# progressing, which is what a queued job looks like.
+idle_heartbeats_soft: 20
+
+engine:
+  type: GlobusComputeEngine
+  max_workers_per_node: 1
+
+  provider:
+    type: SlurmProvider
+    launcher:
+      type: SimpleLauncher
+
+    account: {{ account }}
+    qos: {{ qos | default("debug") }}
+    constraint: {{ constraint | default("gpu") }}
+    walltime: {{ walltime | default("00:30:00") }}
+
+    # Batch-job settings the scheduler needs, not the worker. GPUs must be requested
+    # explicitly -- constraint "gpu" alone does not allocate them, and vLLM then reports
+    # no CUDA device. A containerised job declares its image here too, e.g.
+    #   scheduler_options: |
+    #     #SBATCH --gpus-per-node=4
+    #     #SBATCH --image=<registry>/<image>:<tag>
+    #     #SBATCH --module=gpu,nccl-cu13-plugin
+    scheduler_options: |
+      #SBATCH --gpus-per-node=4
+
+    nodes_per_block: {{ num_nodes | default(1) }}
+    init_blocks: 0
+    min_blocks: 0
+    max_blocks: 1
+
+    # EDIT: activate the environment holding globus-compute-endpoint. The worker
+    # starts in a bare shell. This does NOT have to be the environment the job runs
+    # in -- a task that shells out can source its own there instead, which keeps a
+    # heavy application environment out of the endpoint.
+    worker_init: |
+      # source ~/venvs/myenv/bin/activate
+      # Credentials belong on the machine, not in a repository. A gated model needs one:
+      # export HF_TOKEN=$(cat ~/.hf_token)
+      export TMPDIR=/tmp
+
+# SimpleLauncher gives one worker for the whole allocation, and whatever the job
+# launches spans the node itself -- correct when the application places work on the
+# GPUs itself.
+#
+# For many independent single-GPU tasks instead, fan out one worker per device.
+# A Perlmutter GPU node has 4:
+#
+#     max_workers_per_node: 4
+#     available_accelerators: 4
+#     launcher:
+#       type: SrunLauncher
+#       overrides: "--ntasks 1"
+#
+# Do not combine the two. A per-device worker that then launches its own srun
+# across the node is two nested launches and will not work.

@@ -1,0 +1,8 @@
+claude-agent-sdk
+globus-compute-sdk
+# Optional: only if your task or figures need them.
+# matplotlib
+# mpi4py
+
+# Rendered records in the run viewer (bin/watch.sh, and WATCH=true during a run).
+markdown

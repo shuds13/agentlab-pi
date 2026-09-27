@@ -1,0 +1,13 @@
+{
+  "_comment": "This machine. Jobs defined with local_fn run here in a thread pool, so no Globus Compute endpoint and no users/<you>/local.json are needed.",
+  "remote": false,
+  "ppn": 1,
+  "target": {
+    "env": {}
+  },
+  "bucket_defaults": {
+    "queue": "local",
+    "num_nodes": 1,
+    "walltime": "01:00:00"
+  }
+}

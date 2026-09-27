@@ -1,0 +1,33 @@
+# What this lab runs, and where its own things are.
+#
+#   bin/lab.sh start | stop | status
+#
+# Copy to lab.yaml and edit. That copy is not tracked. Every setting is explained in
+# docs/settings.md; this file is meant to be read at a glance, not to explain itself.
+
+# The environment this lab's code runs in. bin/lab.sh starts its processes without a
+# login shell, so whatever a person's shell sets up is not there.
+activate:   # conda activate agentlab
+
+bridge:     off         # Slack messages reach the secretary
+secretary:  on          # answers from the records, starts and stops runs
+engineer:   off         # this repository, worked on from a channel of its own
+
+# A LiteLLM proxy, for using non-Anthropic models: it translates the Messages API the
+# agent speaks into what the backend wants. litellm/config.yaml names those models.
+# on | off | when-needed, the last meaning a run starts it if it asks for one of them
+# and nothing is answering.
+litellm:        off
+litellm-bin:                        # e.g. ~/venvs/litellm/bin/litellm -- docs/llm.md installs it
+litellm-config: litellm/config.yaml
+litellm-url:    http://0.0.0.0:4000
+litellm-key-file:                   # only if the proxy wants a different credential from the agent's
+
+slack-channel:              # the lab's channel, e.g. C01234567
+engineer-slack-channel:     # the engineer's, if it runs
+engineer-webhook-file:      # file holding its webhook URL, if it posts
+engineer-allow:             # Slack user ids that may instruct it. Empty: anyone in the channel
+engineer-resume: off        # off | last | compact -- carry on yesterday's conversation, summarised down
+
+# Campaigns the secretary may start and stop when asked, space separated. Empty: none.
+startable-campaigns:

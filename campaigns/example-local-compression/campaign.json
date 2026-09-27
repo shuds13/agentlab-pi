@@ -1,0 +1,4 @@
+{
+  "_comment": "Runs on this machine. The task defines local_fn only, so there is no endpoint or account to set.",
+  "system": "local"
+}

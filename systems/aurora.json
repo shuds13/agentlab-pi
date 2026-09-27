@@ -1,0 +1,29 @@
+{
+  "_comment": "Aurora. Starting points only — a campaign overrides anything here that depends on what it runs, in campaign.json. Credentials go in users/<you>/aurora.json.",
+  "endpoint_template": "aurora_pbs",
+  "globus_collection": "f39a7a0f-5bfc-46ce-9615-ba9f8592814f",
+  "globus_collection_name": "ALCF Flare",
+  "globus_collection_root": [
+    "/flare",
+    "/lus/flare/projects"
+  ],
+  "ppn": 1,
+  "target": {
+    "worker_setup": "module load frameworks",
+    "env": {
+      "http_proxy": "http://proxy.alcf.anl.gov:3128",
+      "https_proxy": "http://proxy.alcf.anl.gov:3128",
+      "no_proxy": "localhost,127.0.0.1,.alcf.anl.gov",
+      "TMPDIR": "/tmp"
+    }
+  },
+  "bucket_defaults": {
+    "queue": "debug",
+    "num_nodes": 1,
+    "walltime": "01:00:00",
+    "init_blocks": 0,
+    "min_blocks": 0,
+    "max_blocks": 1,
+    "max_retries_on_system_failure": 0
+  }
+}
