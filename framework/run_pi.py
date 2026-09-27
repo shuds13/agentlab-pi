@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -290,10 +291,17 @@ def main():
 
         model = (harness.state() or {}).get("model", {})
         model_name = model.get("id") if isinstance(model, dict) else str(model)
+        # The budgets and shapes this run had, so the viewer can show how far through
+        # it is without knowing the environment it was launched in.
         write_meta(run_id=RUN_ID, campaign=CAMPAIGN, system=SYSTEM, handle=RUN_ID,
                    harness="pi", model=model_name, status="running",
                    started_at=datetime.now().isoformat(timespec="seconds"),
-                   pid=os.getpid())
+                   pid=os.getpid(), host=socket.gethostname(),
+                   max_submits=tc.MAX_SUBMITS, max_runtime_s=MAX_RUNTIME,
+                   max_turns=MAX_TURNS, work_dir=tc.WORK_DIR,
+                   has_local=tc.HAS_LOCAL, user_prompt_file=USER_PROMPT_FILE,
+                   endpoint=tc.ENDPOINT_ID if tc.HAS_REMOTE else "",
+                   started_by=os.environ.get("STARTED_BY", ""))
         heartbeat()
         log(f"Agent started -- {SYSTEM} · model {model_name} · harness pi")
 
@@ -315,6 +323,7 @@ def main():
         prompt = build_system_prompt(tc) + "\n\n# Your aim this run\n" + load_user_prompt()
 
         empty_turns = 0
+        failed_turns = 0
         stopping = None
         finalize_turns = 0
 
@@ -343,7 +352,19 @@ def main():
 
             submits_before = state["submit_count"]
             turn = harness.prompt(prompt)
-            log(f"\n[turn {turn_num} end] {turn.stop_reason}")
+            log(f"\n[turn {turn_num} end] {turn.stop_reason}"
+                + (f" -- {turn.error}" if turn.error else ""))
+            # A model that cannot answer will not start answering on the next turn, and
+            # the empty-turn counter would read the failure as an agent with nothing to
+            # propose. Stop on the second one and say what went wrong.
+            if turn.error:
+                failed_turns += 1
+                if failed_turns >= 2:
+                    stop_reason = f"harness error: {turn.error}"
+                    log(f"Two failed turns -- stopping. {turn.error}")
+                    break
+            else:
+                failed_turns = 0
 
             record_session(harness, model_name)
             state = last_state = tc.status()

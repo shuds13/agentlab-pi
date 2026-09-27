@@ -24,6 +24,7 @@ class Turn:
         self.tool_calls = []
         self.usage = None
         self.stop_reason = None
+        self.error = None          # why the turn failed, when it did
 
     @property
     def output(self):
@@ -160,6 +161,14 @@ class PiHarness:
                 message = event.get("message") or {}
                 if message.get("role") == "assistant" and message.get("stopReason"):
                     turn.stop_reason = message["stopReason"]
+                    # A turn that fails says why in the message, and saying only
+                    # "error" leaves a run that cannot work looking like a run with
+                    # nothing to do -- three empty turns and a clean exit.
+                    if message["stopReason"] in ("error", "aborted"):
+                        turn.error = (message.get("errorMessage")
+                                      or message.get("error") or "no detail given")
+            elif kind == "auto_retry_end" and not event.get("success"):
+                turn.error = event.get("finalError") or turn.error
             elif kind == "agent_settled":
                 return turn
 

@@ -835,6 +835,10 @@ def _start_run_dir():
                 max_submits=tools.MAX_SUBMITS, max_runtime_s=MAX_RUNTIME,
                 max_turns=MAX_TURNS, critic=CRITIC_LABEL,
                 run_id=RUN_ID, handle=HANDLE, system=SYSTEM, role=ROLE,
+                # Which agent runtime held the conversation. Two runs of one campaign
+                # can differ in harness as well as model, and a result is only
+                # comparable against another when both are known.
+                harness="claude-sdk",
                 endpoint=tools.ENDPOINT_ID if tools.HAS_REMOTE else "",
                 work_dir=tools.WORK_DIR,
                 has_local=tools.HAS_LOCAL,
